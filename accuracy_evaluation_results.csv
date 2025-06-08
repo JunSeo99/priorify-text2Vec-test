@@ -1,0 +1,1 @@
+epoch,steps,hit_rate@1,hit_rate@3,mean_cosine_similarity

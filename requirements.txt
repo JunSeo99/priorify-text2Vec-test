@@ -1,0 +1,15 @@
+scikit-learn
+pandas
+requests
+tqdm
+fastapi
+uvicorn[standard]
+sentence-transformers
+transformers
+torch
+numpy
+pydantic
+faiss-cpu
+python-multipart
+datasets
+pytest
