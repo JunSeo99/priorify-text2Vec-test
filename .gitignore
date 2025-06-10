@@ -86,10 +86,93 @@ env.bak/
 venv.bak/
 
 # model outputs
+.output
 output/
+.models
+models/
 *.npy
 *.pt
 *.bin
 
+.pytest_cache/
 # data folder if it contains sensitive info, might need adjustment
 # data/ 
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# 모델 파일들 (용량이 큰 파일들)
+models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+
+# 데이터 파일들
+data/
+*.csv
+*.json
+*.jsonl
+*.txt
+*.tsv
+
+# 로그 파일들
+*.log
+logs/
+train_val_loss.png
+
+# 임시 파일들
+*.tmp
+*.temp
+.DS_Store
+.vscode/
+.idea/
+
+# 실행 파일들
+*.exe
+*.out
+*.app
+
+# 압축 파일들
+*.zip
+*.tar.gz
+*.rar
+
+# 환경설정 파일들
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Docker
+docker-compose.override.yml
+
+# 추가된 이미지 파일
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp 
