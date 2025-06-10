@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sentence_transformers import SentenceTransformer, InputExample, losses, evaluation, util
+from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
 import random
@@ -69,19 +70,32 @@ class CategoryAccuracyEvaluator(SentenceEvaluator):
 
     def __call__(self, model, output_path: str = None, epoch: int = -1, steps: int = -1) -> float:
         
-        # 기본 키워드 평균 임베딩 계산
+        # F1 스코어 최적화를 위한 고급 카테고리 임베딩 계산
         category_embs = {}
         for name, keywords in self.categories_definitions.items():
-            # 키워드가 없는 경우 0벡터로 처리
             if not keywords:
                 category_embs[name] = np.zeros(model.get_sentence_embedding_dimension())
                 continue
 
+            # 1. 원본 키워드 임베딩
             keyword_embs = model.encode(keywords, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False, batch_size=self.batch_size)
-            avg_emb = np.mean(keyword_embs, axis=0)
-            if np.linalg.norm(avg_emb) > 0:
-                avg_emb = avg_emb / np.linalg.norm(avg_emb)
-            category_embs[name] = avg_emb
+            
+            # 2. NER 처리된 키워드 임베딩
+            ner_keywords = ner_generalize_texts(keywords)
+            ner_keyword_embs = model.encode(ner_keywords, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False, batch_size=self.batch_size)
+            
+            # 3. 카테고리명 자체 임베딩
+            category_name_emb = model.encode([name], convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)[0]
+            
+            # 4. 가중 앙상블 (키워드 0.4 + NER 키워드 0.4 + 카테고리명 0.2)
+            avg_keyword_emb = np.mean(keyword_embs, axis=0)
+            avg_ner_emb = np.mean(ner_keyword_embs, axis=0)
+            
+            ensemble_emb = (avg_keyword_emb * 0.4 + avg_ner_emb * 0.4 + category_name_emb * 0.2)
+            
+            if np.linalg.norm(ensemble_emb) > 0:
+                ensemble_emb = ensemble_emb / np.linalg.norm(ensemble_emb)
+            category_embs[name] = ensemble_emb
 
         category_embs_matrix = np.array([category_embs[name] for name in self.category_names])
 
@@ -259,22 +273,38 @@ class EarlyStoppingEvaluator(SentenceEvaluator):
         return float(-val_loss)
     
     def _calculate_validation_loss(self, model):
-        """validation loss 계산"""
+        """validation loss 계산 - NER 처리된 키워드와 일반 키워드의 앙상블 기법 적용"""
         try:
-            # 키워드 평균 임베딩 계산
+            # 앙상블 카테고리 임베딩 계산 (NER 처리된 키워드 * 0.5 + 일반 키워드 * 0.5)
             category_embs = {}
             for name, keywords in self.categories_definitions.items():
                 if not keywords:
                     category_embs[name] = np.zeros(model.get_sentence_embedding_dimension())
                     continue
-                    
-                keyword_embs = model.encode(keywords, convert_to_numpy=True, 
-                                          normalize_embeddings=True, show_progress_bar=False, 
-                                          batch_size=self.batch_size)
-                avg_emb = np.mean(keyword_embs, axis=0)
-                if np.linalg.norm(avg_emb) > 0:
-                    avg_emb = avg_emb / np.linalg.norm(avg_emb)
-                category_embs[name] = avg_emb
+                
+                # 일반 키워드 임베딩
+                original_keyword_embs = model.encode(keywords, convert_to_numpy=True, 
+                                                   normalize_embeddings=True, show_progress_bar=False, 
+                                                   batch_size=self.batch_size)
+                original_avg_emb = np.mean(original_keyword_embs, axis=0)
+                if np.linalg.norm(original_avg_emb) > 0:
+                    original_avg_emb = original_avg_emb / np.linalg.norm(original_avg_emb)
+                
+                # NER 처리된 키워드 임베딩
+                ner_keywords = ner_generalize_texts(keywords)
+                ner_keyword_embs = model.encode(ner_keywords, convert_to_numpy=True, 
+                                              normalize_embeddings=True, show_progress_bar=False, 
+                                              batch_size=self.batch_size)
+                ner_avg_emb = np.mean(ner_keyword_embs, axis=0)
+                if np.linalg.norm(ner_avg_emb) > 0:
+                    ner_avg_emb = ner_avg_emb / np.linalg.norm(ner_avg_emb)
+                
+                # 앙상블: NER 처리된 키워드 * 0.5 + 일반 키워드 * 0.5
+                ensemble_emb = (ner_avg_emb * 0.5 + original_avg_emb * 0.5)
+                if np.linalg.norm(ensemble_emb) > 0:
+                    ensemble_emb = ensemble_emb / np.linalg.norm(ensemble_emb)
+                
+                category_embs[name] = ensemble_emb
             
             category_embs_matrix = np.array([category_embs[name] for name in self.category_names])
             
@@ -394,40 +424,99 @@ class Finetuner:
 
 
     def create_input_examples(self, df: pd.DataFrame, model: SentenceTransformer):
-        """데이터프레임으로부터 앙상블 기반 InputExample 리스트를 생성합니다."""
-        # 카테고리별 앙상블 임베딩 미리 계산 (단순 카테고리명 + 키워드 평균)
-        logging.info("학습용 앙상블 카테고리 임베딩을 계산 중입니다...")
+        """F1 스코어 최적화를 위한 고급 학습 예시 생성 (Hard Negative Mining + Class Balancing)"""
+        logging.info("F1 스코어 최적화를 위한 고급 학습 예시 생성 중...")
         
+        # 카테고리별 데이터 분포 계산
+        category_counts = {}
+        all_categories_in_data = []
+        for _, row in df.iterrows():
+            for category in row['categories']:
+                if category in self.categories_definitions:
+                    category_counts[category] = category_counts.get(category, 0) + 1
+                    all_categories_in_data.append(category)
+        
+        # 클래스 가중치 계산 (불균형 해결)
+        unique_categories = list(set(all_categories_in_data))
+        class_weights = compute_class_weight('balanced', classes=np.array(unique_categories), y=all_categories_in_data)
+        category_weights = dict(zip(unique_categories, class_weights))
+        
+        logging.info(f"카테고리별 가중치: {category_weights}")
+        
+        # 카테고리별 앙상블 텍스트 준비
         ensemble_category_texts = {}
         for category in self.categories_definitions.keys():
-            # 단순 카테고리명
             simple_text = category
-            
-            # 키워드 평균을 대표하는 텍스트 생성 (키워드들을 합친 텍스트)
             keywords = self.categories_definitions[category]
             if keywords:
-                # 키워드들을 결합하여 하나의 대표 텍스트로 만듦
-                keyword_text = " ".join(keywords[:5])  # 너무 길어지지 않도록 상위 5개만 사용
+                keyword_text = " ".join(keywords[:5])
+                # NER 처리된 키워드도 추가
+                ner_keywords = ner_generalize_texts(keywords[:3])  # 상위 3개만 NER 처리
+                ner_keyword_text = " ".join(ner_keywords)
             else:
                 keyword_text = category
+                ner_keyword_text = category
             
-            # 앙상블을 위한 두 텍스트 저장
             ensemble_category_texts[category] = {
                 'simple': simple_text,
-                'keywords': keyword_text
+                'keywords': keyword_text,
+                'ner_keywords': ner_keyword_text
             }
         
         examples = []
-        for _, row in tqdm(df.iterrows(), total=len(df), desc="앙상블 학습 예시 생성 중"):
+        
+        # Positive examples 생성 (클래스 가중치 적용)
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="Positive 예시 생성"):
             title = row['generalized_title']
+            original_title = row['title']
+            
             for category in row['categories']:
                 if category in ensemble_category_texts:
-                    # 앙상블 방식: 단순 카테고리명과 키워드 텍스트를 모두 positive sample로 사용
-                    examples.append(InputExample(texts=[title, ensemble_category_texts[category]['simple']]))
-                    examples.append(InputExample(texts=[title, ensemble_category_texts[category]['keywords']]))
+                    weight = category_weights.get(category, 1.0)
+                    repeat_count = max(1, int(weight))  # 가중치에 따라 반복 횟수 결정
+                    
+                    for _ in range(repeat_count):
+                        # 다양한 positive 조합 생성 (label=1.0)
+                        examples.append(InputExample(texts=[title, ensemble_category_texts[category]['simple']], label=1.0))
+                        examples.append(InputExample(texts=[title, ensemble_category_texts[category]['keywords']], label=1.0))
+                        examples.append(InputExample(texts=[original_title, ensemble_category_texts[category]['ner_keywords']], label=1.0))
         
-        logging.info(f"총 {len(examples)}개의 앙상블 학습 예시가 생성되었습니다.")
+        # Hard Negative Mining: 유사한 카테고리들을 negative로 사용
+        logging.info("Hard Negative Mining 시작...")
+        category_similarities = self._calculate_category_similarities(model)
+        
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="Hard Negative 예시 생성"):
+            title = row['generalized_title']
+            original_title = row['title']
+            true_categories = set(row['categories'])
+            
+            for true_category in true_categories:
+                if true_category in category_similarities:
+                    # 유사하지만 다른 카테고리들을 hard negative로 사용
+                    similar_categories = category_similarities[true_category][:2]  # 상위 2개
+                    
+                    for similar_cat in similar_categories:
+                        if similar_cat not in true_categories:
+                            # Hard negative example 추가 (label=0.0)
+                            examples.append(InputExample(texts=[title, ensemble_category_texts[similar_cat]['simple']], label=0.0))
+                            examples.append(InputExample(texts=[original_title, ensemble_category_texts[similar_cat]['keywords']], label=0.0))
+        
+        logging.info(f"총 {len(examples)}개의 고급 학습 예시가 생성되었습니다.")
         return examples
+    
+    def _calculate_category_similarities(self, model):
+        """카테고리 간 유사도 계산하여 Hard Negative Mining에 활용"""
+        category_names = list(self.categories_definitions.keys())
+        category_embs = model.encode(category_names, convert_to_numpy=True, normalize_embeddings=True)
+        
+        similarities = {}
+        for i, category in enumerate(category_names):
+            # 자기 자신을 제외한 유사도 계산
+            cos_sims = np.dot(category_embs[i], category_embs.T)
+            sorted_indices = np.argsort(cos_sims)[::-1][1:]  # 자기 자신 제외
+            similarities[category] = [category_names[j] for j in sorted_indices]
+        
+        return similarities
 
     def run_finetuning(self):
         """전체 파인튜닝 파이프라인을 실행합니다."""
@@ -448,7 +537,12 @@ class Finetuner:
             return
 
         train_dataloader = DataLoader(train_examples, shuffle=True, batch_size=self.args.batch_size)
-        train_loss = losses.MultipleNegativesRankingLoss(model)
+        
+        # F1 스코어 최적화를 위한 CosineSimilarityLoss 사용 (분류에 더 적합)
+        train_loss = losses.CosineSimilarityLoss(model)
+        
+        logging.info(f"F1 스코어 최적화를 위해 CosineSimilarityLoss를 사용합니다.")
+        logging.info(f"Hard Negative Mining과 Class Balancing이 적용된 {len(train_examples)}개의 학습 예시로 훈련합니다.")
 
         # 조기 종료 평가자 설정 
         early_stopping_evaluator = EarlyStoppingEvaluator(

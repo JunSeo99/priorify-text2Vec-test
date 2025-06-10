@@ -123,7 +123,22 @@ class AlgorithmEvaluator:
     def _evaluate_version(self, version_name, model, title_column, category_embs):
         """단일 버전 성능 평가 로직. 다양한 지표를 계산하여 반환."""
         logging.info(f"--- {version_name} 평가 시작 ---")
-        title_embs = model.encode(self.test_df[title_column].tolist(), convert_to_tensor=True, normalize_embeddings=True)
+        
+        # 앙상블 임베딩 계산: NER 처리된 제목 * 0.5 + 일반 제목 * 0.5
+        original_titles = self.test_df['title'].tolist()
+        generalized_titles = self.test_df[title_column].tolist()
+        
+        # 일반 제목 임베딩
+        original_title_embs = model.encode(original_titles, convert_to_tensor=True, normalize_embeddings=True)
+        
+        # NER 처리된 제목 임베딩
+        generalized_title_embs = model.encode(generalized_titles, convert_to_tensor=True, normalize_embeddings=True)
+        
+        # 앙상블: NER 처리된 제목 * 0.5 + 일반 제목 * 0.5
+        title_embs = (generalized_title_embs * 0.5 + original_title_embs * 0.5)
+        
+        # 정규화
+        title_embs = torch.nn.functional.normalize(title_embs, p=2, dim=1)
         
         similarities = util.cos_sim(title_embs, category_embs)
         

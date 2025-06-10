@@ -4,7 +4,7 @@
 BASE_MODEL_NAME = "jhgan/ko-sroberta-multitask"
 NER_MODEL_NAME = "Leo97/KoELECTRA-small-v3-modu-ner"
 DATA_PATH = "data/data.csv"
-DEFAULT_OUTPUT_PATH = "models/finetuned_ensemble_v4"
+DEFAULT_OUTPUT_PATH = "models/modelv4"
 
 # --- NER 관련 설정 ---
 # Leo97/KoELECTRA-small-v3-modu-ner 모델이 사용하는 엔티티 태그 목록입니다.
@@ -14,11 +14,11 @@ DEFAULT_OUTPUT_PATH = "models/finetuned_ensemble_v4"
 
 # 방법1: 의미적으로 명확한 한국어 플레이스홀더
 NER_ENTITY_PLACEHOLDERS = {
-    "AF": "그거",       # ARTIFACTS
-    "PS": "사람",       # Person
-    "LC": "그곳",       # Location  
-    "DT": "그날",       # Date
-    "TI": "그때",       # Time
+    "AF": "<AF>",       # ARTIFACTS
+    "PS": "<PS>",       # Person
+    "LC": "<LC>",       # Location  
+    "DT": "<DT>",       # Date
+    "TI": "<TI>",       # Time
     # "QT": "그만큼",       # Quantity
 }
 
