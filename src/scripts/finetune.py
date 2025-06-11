@@ -1,12 +1,14 @@
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sentence_transformers import SentenceTransformer, InputExample, losses, evaluation, util
 from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
 import random
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import os
 from tqdm import tqdm
 import logging
@@ -21,6 +23,8 @@ matplotlib.use('Agg')  # GUI 없이 그래프 저장
 from torch.utils.data import DataLoader
 import json
 import warnings
+from collections import defaultdict
+from sklearn.metrics import f1_score, classification_report
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # 프로젝트 루트를 경로에 추가
@@ -48,6 +52,125 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+class AdaptiveThresholdLearner(nn.Module):
+    """Phase 3: 적응형 threshold 학습 모듈"""
+    def __init__(self, input_dim=768, num_categories=25):
+        super().__init__()
+        self.threshold_net = nn.Sequential(
+            nn.Linear(input_dim + num_categories, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, text_emb, similarity_scores):
+        """텍스트 임베딩과 유사도 점수를 바탕으로 threshold 예측"""
+        combined = torch.cat([text_emb, similarity_scores], dim=-1)
+        threshold = self.threshold_net(combined)
+        return threshold
+
+class DynamicEnsembleWeights(nn.Module):
+    """Phase 2: 동적 앙상블 가중치 학습"""
+    def __init__(self, input_dim=768):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(input_dim * 2, 128),
+            nn.ReLU(),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 2),
+            nn.Softmax(dim=-1)
+        )
+        
+    def forward(self, ner_emb, original_emb):
+        """NER 임베딩과 원본 임베딩의 동적 가중치 계산"""
+        combined = torch.cat([ner_emb, original_emb], dim=-1)
+        weights = self.attention(combined)
+        return weights
+
+class ContrastiveLoss(nn.Module):
+    """Phase 2: Class-aware Contrastive Learning Loss"""
+    def __init__(self, temperature=0.1):
+        super().__init__()
+        self.temperature = temperature
+        
+    def forward(self, embeddings, labels, class_weights=None):
+        """대조 학습 손실 계산 (클래스 가중치 반영)"""
+        # L2 정규화
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+        
+        # 유사도 행렬 계산
+        similarity_matrix = torch.matmul(embeddings, embeddings.T) / self.temperature
+        
+        # 마스크 생성 (같은 클래스끼리는 positive)
+        labels = labels.view(-1, 1)
+        mask = torch.eq(labels, labels.T).float()
+        
+        # Positive와 negative 분리
+        exp_sim = torch.exp(similarity_matrix)
+        
+        # 대각선 제거 (자기 자신 제외)
+        logits_mask = torch.ones_like(mask) - torch.eye(mask.size(0)).to(mask.device)
+        mask = mask * logits_mask
+        
+        # Positive pairs의 로그 확률
+        log_prob = similarity_matrix - torch.log(torch.sum(exp_sim * logits_mask, dim=1, keepdim=True) + 1e-8)
+        
+        # 클래스 가중치 적용
+        if class_weights is not None:
+            weight_matrix = class_weights[labels.flatten()].view(-1, 1)
+            log_prob = log_prob * weight_matrix
+        
+        # 평균 손실 계산
+        mean_log_prob_pos = torch.sum(mask * log_prob, dim=1) / (torch.sum(mask, dim=1) + 1e-8)
+        loss = -mean_log_prob_pos.mean()
+        
+        return loss
+
+class CurriculumLearner:
+    """Phase 3: Curriculum Learning 구현"""
+    def __init__(self, categories_definitions, initial_difficulty=0.3):
+        self.categories_definitions = categories_definitions
+        self.category_difficulty = self._calculate_initial_difficulty()
+        self.current_difficulty = initial_difficulty
+        
+    def _calculate_initial_difficulty(self):
+        """카테고리별 초기 난이도 계산 (키워드 수, 키워드 길이 기반)"""
+        difficulties = {}
+        for category, keywords in self.categories_definitions.items():
+            if not keywords:
+                difficulties[category] = 1.0  # 가장 어려움
+                continue
+                
+            # 키워드 수와 평균 길이를 고려한 난이도
+            avg_length = np.mean([len(kw.split()) for kw in keywords])
+            keyword_count = len(keywords)
+            
+            # 키워드가 많고 길수록 쉬움 (더 많은 정보)
+            difficulty = 1.0 / (1.0 + 0.1 * keyword_count + 0.05 * avg_length)
+            difficulties[category] = min(difficulty, 1.0)
+            
+        return difficulties
+    
+    def get_curriculum_data(self, df, epoch):
+        """현재 에포크에 맞는 커리큘럼 데이터 반환"""
+        # 에포크가 진행될수록 어려운 카테고리도 포함
+        self.current_difficulty = min(1.0, 0.3 + epoch * 0.1)
+        
+        filtered_data = []
+        for _, row in df.iterrows():
+            row_difficulty = max([self.category_difficulty.get(cat, 1.0) for cat in row['categories']])
+            if row_difficulty <= self.current_difficulty:
+                filtered_data.append(row)
+        
+        if len(filtered_data) < len(df) * 0.3:  # 최소 30%는 유지
+            return df
+        
+        return pd.DataFrame(filtered_data)
+
 class CategoryAccuracyEvaluator(SentenceEvaluator):
     """
     주어진 데이터셋에 대해 카테고리 분류 정확도를 평가하는 클래스.
@@ -70,33 +193,8 @@ class CategoryAccuracyEvaluator(SentenceEvaluator):
 
     def __call__(self, model, output_path: str = None, epoch: int = -1, steps: int = -1) -> float:
         
-        # F1 스코어 최적화를 위한 고급 카테고리 임베딩 계산
-        category_embs = {}
-        for name, keywords in self.categories_definitions.items():
-            if not keywords:
-                category_embs[name] = np.zeros(model.get_sentence_embedding_dimension())
-                continue
-
-            # 1. 원본 키워드 임베딩
-            keyword_embs = model.encode(keywords, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False, batch_size=self.batch_size)
-            
-            # 2. NER 처리된 키워드 임베딩
-            ner_keywords = ner_generalize_texts(keywords)
-            ner_keyword_embs = model.encode(ner_keywords, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False, batch_size=self.batch_size)
-            
-            # 3. 카테고리명 자체 임베딩
-            category_name_emb = model.encode([name], convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)[0]
-            
-            # 4. 가중 앙상블 (키워드 0.4 + NER 키워드 0.4 + 카테고리명 0.2)
-            avg_keyword_emb = np.mean(keyword_embs, axis=0)
-            avg_ner_emb = np.mean(ner_keyword_embs, axis=0)
-            
-            ensemble_emb = (avg_keyword_emb * 0.4 + avg_ner_emb * 0.4 + category_name_emb * 0.2)
-            
-            if np.linalg.norm(ensemble_emb) > 0:
-                ensemble_emb = ensemble_emb / np.linalg.norm(ensemble_emb)
-            category_embs[name] = ensemble_emb
-
+        # Phase 1: 다층 카테고리 임베딩 계산
+        category_embs = self._compute_multilayer_category_embeddings(model)
         category_embs_matrix = np.array([category_embs[name] for name in self.category_names])
 
         # 테스트 데이터의 제목 임베딩
@@ -161,6 +259,77 @@ class CategoryAccuracyEvaluator(SentenceEvaluator):
 
         # 앙상블 성능을 기준으로 best model 선택
         return ensemble_hit_rate_1 if self.use_ensemble else final_hit_rate_1
+    
+    def _compute_multilayer_category_embeddings(self, model):
+        """Phase 1: 다층 카테고리 임베딩 계산"""
+        category_embs = {}
+        
+        for name, keywords in self.categories_definitions.items():
+            if not keywords:
+                category_embs[name] = np.zeros(model.get_sentence_embedding_dimension())
+                continue
+
+            # Layer 1: 원본 키워드 임베딩
+            keyword_embs = model.encode(keywords, convert_to_numpy=True, normalize_embeddings=True, 
+                                      show_progress_bar=False, batch_size=self.batch_size)
+            avg_keyword_emb = np.mean(keyword_embs, axis=0)
+            
+            # Layer 2: NER 처리된 키워드 임베딩
+            ner_keywords = ner_generalize_texts(keywords)
+            ner_keyword_embs = model.encode(ner_keywords, convert_to_numpy=True, normalize_embeddings=True, 
+                                          show_progress_bar=False, batch_size=self.batch_size)
+            avg_ner_emb = np.mean(ner_keyword_embs, axis=0)
+            
+            # Layer 3: 키워드별 최대 유사도 임베딩 (가중 평균)
+            keyword_lengths = [len(kw.split()) for kw in keywords]
+            weights = np.array(keyword_lengths) / np.sum(keyword_lengths)
+            weighted_keyword_emb = np.average(keyword_embs, axis=0, weights=weights)
+            
+            # Layer 4: 카테고리명 자체 임베딩
+            category_name_emb = model.encode([name], convert_to_numpy=True, normalize_embeddings=True, 
+                                           show_progress_bar=False)[0]
+            
+            # Layer 5: 의미적 확장 (관련 카테고리들과의 관계 고려)
+            semantic_context_emb = self._get_semantic_context_embedding(name, model)
+            
+            # 다층 앙상블 (가중치 최적화)
+            ensemble_emb = (
+                avg_keyword_emb * 0.25 +        # 원본 키워드
+                avg_ner_emb * 0.25 +            # NER 키워드  
+                weighted_keyword_emb * 0.2 +    # 가중 키워드
+                category_name_emb * 0.2 +       # 카테고리명
+                semantic_context_emb * 0.1      # 의미적 맥락
+            )
+            
+            if np.linalg.norm(ensemble_emb) > 0:
+                ensemble_emb = ensemble_emb / np.linalg.norm(ensemble_emb)
+            category_embs[name] = ensemble_emb
+            
+        return category_embs
+    
+    def _get_semantic_context_embedding(self, category_name, model):
+        """의미적 맥락 임베딩 계산"""
+        try:
+            # 관련 카테고리들의 임베딩을 평균내어 맥락 정보 생성
+            related_categories = []
+            for other_cat in self.categories_definitions.keys():
+                if other_cat != category_name:
+                    # 카테고리명 유사도 기반으로 관련 카테고리 선별
+                    cat_sim = util.cos_sim(
+                        model.encode([category_name], convert_to_tensor=True),
+                        model.encode([other_cat], convert_to_tensor=True)
+                    ).item()
+                    if cat_sim > 0.3:  # 임계값 이상의 유사한 카테고리
+                        related_categories.append(other_cat)
+            
+            if related_categories:
+                context_embs = model.encode(related_categories[:3], convert_to_numpy=True, 
+                                          normalize_embeddings=True, show_progress_bar=False)
+                return np.mean(context_embs, axis=0)
+            else:
+                return np.zeros(model.get_sentence_embedding_dimension())
+        except:
+            return np.zeros(model.get_sentence_embedding_dimension())
 
     def _evaluate_ensemble(self, model, test_titles_embs, keyword_avg_embs):
         """앙상블 평가: 단순 카테고리명 + 키워드 평균 (0.5:0.5)"""
@@ -385,7 +554,7 @@ class EarlyStoppingEvaluator(SentenceEvaluator):
         except Exception as e:
             print(f"그래프 저장 중 오류: {e}")
 
-class Finetuner:
+class AdvancedFinetuner:
     def __init__(self, args):
         self.args = args
         set_seed(self.args.seed)
@@ -393,13 +562,27 @@ class Finetuner:
         # config와 model_utils를 사용
         self.categories_definitions = CATEGORIES_DEFINITIONS
         self.ner_special_tokens = NER_SPECIAL_TOKENS
+        self.category_names = list(self.categories_definitions.keys())
 
         if not torch.cuda.is_available():
             logging.warning("CUDA를 사용할 수 없습니다. CPU로 학습을 진행합니다. 시간이 오래 걸릴 수 있습니다.")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Phase 2 & 3: 모듈 초기화
+        self.dynamic_ensemble = None
+        self.threshold_learner = None
+        self.curriculum_learner = CurriculumLearner(self.categories_definitions)
+        self.contrastive_loss = ContrastiveLoss(temperature=0.1)
+        
+        # 계층적 Hard Negative Mining 설정
+        self.similarity_ranges = [
+            (0.7, 0.9, 0.6),  # Level 1: 매우 유사 (높은 가중치)
+            (0.4, 0.7, 0.3),  # Level 2: 중간 유사
+            (0.0, 0.4, 0.1)   # Level 3: 낮은 유사 (낮은 가중치)
+        ]
 
     def load_and_prepare_data(self):
-        """CSV 파일에서 데이터를 로드하고 학습/테스트용으로 분할 및 전처리합니다."""
+        """Phase 1: Stratified K-Fold를 사용한 데이터 분할 및 전처리"""
         logging.info(f"데이터 로딩 및 전처리 시작: {self.args.data_path}")
         try:
             df = pd.read_csv(self.args.data_path, on_bad_lines='skip')
@@ -410,12 +593,25 @@ class Finetuner:
             logging.error(f"데이터 파일을 찾을 수 없습니다: '{self.args.data_path}'")
             return None, None
 
-        train_df, test_df = train_test_split(df, test_size=self.args.test_size, random_state=self.args.seed)
-        logging.info(f"데이터 분할 완료. 학습 데이터: {len(train_df)}개, 테스트 데이터: {len(test_df)}개")
+        # Stratified split를 위한 label 준비 (첫 번째 카테고리 사용)
+        df['primary_category'] = df['categories'].apply(lambda x: x[0] if x else 'unknown')
+        
+        # Stratified K-Fold 분할
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=self.args.seed)
+        train_indices, test_indices = next(skf.split(df, df['primary_category']))
+        
+        train_df = df.iloc[train_indices].copy()
+        test_df = df.iloc[test_indices].copy()
+        
+        logging.info(f"Stratified 데이터 분할 완료. 학습: {len(train_df)}개, 테스트: {len(test_df)}개")
+        
+        # 카테고리별 분포 로깅
+        train_dist = train_df['primary_category'].value_counts()
+        test_dist = test_df['primary_category'].value_counts()
+        logging.info(f"학습 데이터 카테고리 분포: {dict(train_dist.head())}")
+        logging.info(f"테스트 데이터 카테고리 분포: {dict(test_dist.head())}")
 
-        train_df = train_df.copy()
-        test_df = test_df.copy()
-
+        # NER 전처리
         train_df['generalized_title'] = ner_generalize_texts(train_df['title'].tolist())
         test_df['generalized_title'] = ner_generalize_texts(test_df['title'].tolist())
 
@@ -423,86 +619,199 @@ class Finetuner:
     # def ner_generalize_texts(self, texts: list[str]):
 
 
-    def create_input_examples(self, df: pd.DataFrame, model: SentenceTransformer):
-        """F1 스코어 최적화를 위한 고급 학습 예시 생성 (Hard Negative Mining + Class Balancing)"""
-        logging.info("F1 스코어 최적화를 위한 고급 학습 예시 생성 중...")
+    def create_advanced_input_examples(self, df: pd.DataFrame, model: SentenceTransformer, epoch: int = 0):
+        """Phase 1-3:학습 예시 생성"""
+        logging.info("Phase 1-3: 학습 예시 생성 중...")
         
-        # 카테고리별 데이터 분포 계산
-        category_counts = {}
-        all_categories_in_data = []
-        for _, row in df.iterrows():
-            for category in row['categories']:
-                if category in self.categories_definitions:
-                    category_counts[category] = category_counts.get(category, 0) + 1
-                    all_categories_in_data.append(category)
+        # Phase 3: Curriculum Learning 적용
+        curriculum_df = self.curriculum_learner.get_curriculum_data(df, epoch)
+        logging.info(f"Curriculum Learning: {len(curriculum_df)}/{len(df)} 데이터 사용 (난이도: {self.curriculum_learner.current_difficulty:.2f})")
         
-        # 클래스 가중치 계산 (불균형 해결)
-        unique_categories = list(set(all_categories_in_data))
-        class_weights = compute_class_weight('balanced', classes=np.array(unique_categories), y=all_categories_in_data)
-        category_weights = dict(zip(unique_categories, class_weights))
+        # Phase 1: Class balancing (강화)
+        category_weights = self._compute_enhanced_class_weights(curriculum_df)
         
-        logging.info(f"카테고리별 가중치: {category_weights}")
-        
-        # 카테고리별 앙상블 텍스트 준비
-        ensemble_category_texts = {}
-        for category in self.categories_definitions.keys():
-            simple_text = category
-            keywords = self.categories_definitions[category]
-            if keywords:
-                keyword_text = " ".join(keywords[:5])
-                # NER 처리된 키워드도 추가
-                ner_keywords = ner_generalize_texts(keywords[:3])  # 상위 3개만 NER 처리
-                ner_keyword_text = " ".join(ner_keywords)
-            else:
-                keyword_text = category
-                ner_keyword_text = category
-            
-            ensemble_category_texts[category] = {
-                'simple': simple_text,
-                'keywords': keyword_text,
-                'ner_keywords': ner_keyword_text
-            }
+        # Phase 1: 다층 카테고리 텍스트 준비
+        ensemble_category_texts = self._prepare_multilayer_category_texts()
         
         examples = []
         
-        # Positive examples 생성 (클래스 가중치 적용)
-        for _, row in tqdm(df.iterrows(), total=len(df), desc="Positive 예시 생성"):
+        # Phase 2: Positive examples 생성 (동적 앙상블 적용)
+        for _, row in tqdm(curriculum_df.iterrows(), total=len(curriculum_df), desc="Positive 예시 생성"):
             title = row['generalized_title']
             original_title = row['title']
+            
+            # Phase 2: 동적 앙상블 가중치 계산
+            if self.dynamic_ensemble is not None:
+                ner_emb = model.encode([title], convert_to_tensor=True)
+                orig_emb = model.encode([original_title], convert_to_tensor=True)
+                weights = self.dynamic_ensemble(ner_emb, orig_emb).detach().cpu().numpy()[0]
+                dynamic_title = f"{title} {original_title}"  # 가중치 반영된 텍스트 조합
+            else:
+                dynamic_title = title
             
             for category in row['categories']:
                 if category in ensemble_category_texts:
                     weight = category_weights.get(category, 1.0)
-                    repeat_count = max(1, int(weight))  # 가중치에 따라 반복 횟수 결정
+                    repeat_count = max(1, min(int(weight * 2), 5))  # 최대 5회 반복
                     
                     for _ in range(repeat_count):
-                        # 다양한 positive 조합 생성 (label=1.0)
-                        examples.append(InputExample(texts=[title, ensemble_category_texts[category]['simple']], label=1.0))
-                        examples.append(InputExample(texts=[title, ensemble_category_texts[category]['keywords']], label=1.0))
-                        examples.append(InputExample(texts=[original_title, ensemble_category_texts[category]['ner_keywords']], label=1.0))
+                        # 다층 positive 조합 생성
+                        examples.extend([
+                            InputExample(texts=[dynamic_title, ensemble_category_texts[category]['simple']], label=1.0),
+                            InputExample(texts=[dynamic_title, ensemble_category_texts[category]['keywords']], label=1.0),
+                            InputExample(texts=[original_title, ensemble_category_texts[category]['ner_keywords']], label=1.0),
+                            InputExample(texts=[title, ensemble_category_texts[category]['semantic']], label=1.0),
+                            InputExample(texts=[dynamic_title, ensemble_category_texts[category]['weighted']], label=1.0)
+                        ])
         
-        # Hard Negative Mining: 유사한 카테고리들을 negative로 사용
-        logging.info("Hard Negative Mining 시작...")
-        category_similarities = self._calculate_category_similarities(model)
+        # Phase 2: 계층적 Hard Negative Mining
+        logging.info("Phase 2: 계층적 Hard Negative Mining 시작...")
+        hierarchical_negatives = self._generate_hierarchical_hard_negatives(curriculum_df, model, ensemble_category_texts)
+        examples.extend(hierarchical_negatives)
         
-        for _, row in tqdm(df.iterrows(), total=len(df), desc="Hard Negative 예시 생성"):
+        # Phase 3: Meta-learning을 위한 Few-shot 예시 추가
+        meta_examples = self._generate_meta_learning_examples(curriculum_df, ensemble_category_texts)
+        examples.extend(meta_examples)
+        
+        logging.info(f"총 {len(examples)}개의 학습 예시가 생성되었습니다.")
+        return examples
+    
+    def _compute_enhanced_class_weights(self, df):
+        """Phase 1: 강화된 클래스 가중치 계산"""
+        category_counts = defaultdict(int)
+        all_categories = []
+        
+        for _, row in df.iterrows():
+            for category in row['categories']:
+                if category in self.categories_definitions:
+                    category_counts[category] += 1
+                    all_categories.append(category)
+        
+        # 기본 가중치
+        unique_categories = list(set(all_categories))
+        base_weights = compute_class_weight('balanced', classes=np.array(unique_categories), y=all_categories)
+        
+        # 추가 가중치 (키워드 수, 카테고리 복잡도 고려)
+        enhanced_weights = {}
+        for i, category in enumerate(unique_categories):
+            base_weight = base_weights[i]
+            keyword_count = len(self.categories_definitions.get(category, []))
+            complexity_factor = 1.0 + (1.0 / max(keyword_count, 1))  # 키워드 적을수록 높은 가중치
+            enhanced_weights[category] = base_weight * complexity_factor
+        
+        logging.info(f"강화된 카테고리별 가중치: {enhanced_weights}")
+        return enhanced_weights
+    
+    def _prepare_multilayer_category_texts(self):
+        """Phase 1: 다층 카테고리 텍스트 준비"""
+        ensemble_texts = {}
+        
+        for category in self.categories_definitions.keys():
+            keywords = self.categories_definitions[category]
+            
+            # Layer 1: 단순 카테고리명
+            simple_text = category
+            
+            # Layer 2: 키워드 조합
+            if keywords:
+                keyword_text = " ".join(keywords[:5])
+                ner_keyword_text = " ".join(ner_generalize_texts(keywords[:3]))
+                
+                # Layer 3: 가중 키워드 (길이 기반)
+                keyword_lengths = [len(kw.split()) for kw in keywords]
+                if sum(keyword_lengths) > 0:
+                    weights = np.array(keyword_lengths) / sum(keyword_lengths)
+                    top_indices = np.argsort(weights)[-3:]  # 상위 3개
+                    weighted_text = " ".join([keywords[i] for i in top_indices])
+                else:
+                    weighted_text = keyword_text
+                
+                # Layer 4: 의미적 확장
+                semantic_text = f"{category} 관련 {keyword_text}"
+            else:
+                keyword_text = ner_keyword_text = weighted_text = semantic_text = category
+            
+            ensemble_texts[category] = {
+                'simple': simple_text,
+                'keywords': keyword_text,
+                'ner_keywords': ner_keyword_text,
+                'weighted': weighted_text,
+                'semantic': semantic_text
+            }
+        
+        return ensemble_texts
+    
+    def _generate_hierarchical_hard_negatives(self, df, model, ensemble_texts):
+        """Phase 2: 계층적 Hard Negative Mining"""
+        negatives = []
+        category_similarities = self._calculate_hierarchical_similarities(model)
+        
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="계층적 Hard Negative 생성"):
             title = row['generalized_title']
-            original_title = row['title']
             true_categories = set(row['categories'])
             
             for true_category in true_categories:
                 if true_category in category_similarities:
-                    # 유사하지만 다른 카테고리들을 hard negative로 사용
-                    similar_categories = category_similarities[true_category][:2]  # 상위 2개
-                    
-                    for similar_cat in similar_categories:
-                        if similar_cat not in true_categories:
-                            # Hard negative example 추가 (label=0.0)
-                            examples.append(InputExample(texts=[title, ensemble_category_texts[similar_cat]['simple']], label=0.0))
-                            examples.append(InputExample(texts=[original_title, ensemble_category_texts[similar_cat]['keywords']], label=0.0))
+                    # 3단계 계층별 negative 생성
+                    for level, (min_sim, max_sim, weight) in enumerate(self.similarity_ranges):
+                        similar_cats = category_similarities[true_category].get(f'level_{level}', [])
+                        
+                        for similar_cat in similar_cats[:2]:  # 각 레벨에서 2개씩
+                            if similar_cat not in true_categories:
+                                # 레벨별 가중치 적용
+                                for _ in range(int(weight * 10)):  # 가중치에 따른 반복
+                                    negatives.append(
+                                        InputExample(texts=[title, ensemble_texts[similar_cat]['simple']], label=0.0)
+                                    )
         
-        logging.info(f"총 {len(examples)}개의 고급 학습 예시가 생성되었습니다.")
-        return examples
+        return negatives
+    
+    def _calculate_hierarchical_similarities(self, model):
+        """계층적 카테고리 유사도 계산"""
+        category_embs = model.encode(self.category_names, convert_to_numpy=True, normalize_embeddings=True)
+        hierarchical_sims = {}
+        
+        for i, category in enumerate(self.category_names):
+            cos_sims = np.dot(category_embs[i], category_embs.T)
+            
+            # 계층별 분류
+            level_categories = {'level_0': [], 'level_1': [], 'level_2': []}
+            
+            for j, other_cat in enumerate(self.category_names):
+                if i != j:
+                    sim_score = cos_sims[j]
+                    for level, (min_sim, max_sim, _) in enumerate(self.similarity_ranges):
+                        if min_sim <= sim_score < max_sim:
+                            level_categories[f'level_{level}'].append(other_cat)
+                            break
+            
+            hierarchical_sims[category] = level_categories
+        
+        return hierarchical_sims
+    
+    def _generate_meta_learning_examples(self, df, ensemble_texts):
+        """Phase 3: Meta-learning을 위한 Few-shot 예시 생성"""
+        meta_examples = []
+        
+        # 각 카테고리별 대표 예시 선별
+        category_samples = defaultdict(list)
+        for _, row in df.iterrows():
+            for category in row['categories']:
+                if category in ensemble_texts:
+                    category_samples[category].append(row['generalized_title'])
+        
+        # Few-shot 학습을 위한 대표 예시 조합
+        for category, samples in category_samples.items():
+            if len(samples) >= 3:
+                # 상위 3개 대표 샘플로 메타 학습 예시 생성
+                representative_samples = samples[:3]
+                combined_text = " [SEP] ".join(representative_samples)
+                
+                meta_examples.append(
+                    InputExample(texts=[combined_text, ensemble_texts[category]['simple']], label=1.0)
+                )
+        
+        return meta_examples
     
     def _calculate_category_similarities(self, model):
         """카테고리 간 유사도 계산하여 Hard Negative Mining에 활용"""
@@ -518,116 +827,283 @@ class Finetuner:
         
         return similarities
 
-    def run_finetuning(self):
-        """전체 파인튜닝 파이프라인을 실행합니다."""
+    def run_advanced_finetuning(self):
+        """Phase 1-3: 파인튜닝 파이프라인 실행"""
         train_df, test_df = self.load_and_prepare_data()
         if train_df is None:
             return
 
-        # 모델을 먼저 로드
+        # 모델 로드 및 초기화
         logging.info(f"'{self.args.model_name}' 모델을 로드합니다.")
         model = SentenceTransformer(self.args.model_name, device=self.device)
         model.tokenizer.add_special_tokens({"additional_special_tokens": self.ner_special_tokens})
         model._first_module().auto_model.resize_token_embeddings(len(model.tokenizer))
 
-        # 앙상블 방식으로 학습 예시 생성
-        train_examples = self.create_input_examples(train_df, model)
-        if not train_examples:
-            logging.error("학습 예시를 생성할 수 없습니다. 데이터나 카테고리 정의를 확인해주세요.")
-            return
-
-        train_dataloader = DataLoader(train_examples, shuffle=True, batch_size=self.args.batch_size)
+        # Phase 2 & 3: 초기화
+        embedding_dim = model.get_sentence_embedding_dimension()
+        self.dynamic_ensemble = DynamicEnsembleWeights(embedding_dim).to(self.device)
+        self.threshold_learner = AdaptiveThresholdLearner(embedding_dim, len(self.category_names)).to(self.device)
         
-        # F1 스코어 최적화를 위한 CosineSimilarityLoss 사용 (분류에 더 적합)
-        train_loss = losses.CosineSimilarityLoss(model)
+        # Phase 2: Contrastive Loss와 Cosine Loss 결합
+        cosine_loss = losses.CosineSimilarityLoss(model)
         
-        logging.info(f"F1 스코어 최적화를 위해 CosineSimilarityLoss를 사용합니다.")
-        logging.info(f"Hard Negative Mining과 Class Balancing이 적용된 {len(train_examples)}개의 학습 예시로 훈련합니다.")
-
-        # 조기 종료 평가자 설정 
-        early_stopping_evaluator = EarlyStoppingEvaluator(
-            test_df, 
-            self.categories_definitions, 
+        # 평가자 설정
+        advanced_evaluator = AdvancedCategoryEvaluator(
+            test_df, self.categories_definitions, 
+            threshold_learner=self.threshold_learner,
+            dynamic_ensemble=self.dynamic_ensemble,
             patience=self.args.patience,
-            name='early-stopping',
             batch_size=self.args.batch_size
         )
 
-        # 에포크 수를 매우 높게 설정 (실제로는 조기 종료됨)
         max_epochs = self.args.max_epochs
-        warmup_steps = math.ceil(len(train_dataloader) * max_epochs * self.args.warmup_ratio)
+        logging.info(f"Phase 1-3 모델 파인튜닝을 시작합니다...")
+        logging.info(f"Dynamic Ensemble, Adaptive Threshold, Curriculum Learning 모두 적용됨")
         
-        logging.info(f"학습 파라미터: max_epochs={max_epochs}, batch_size={self.args.batch_size}, lr={self.args.lr}, patience={self.args.patience}")
-        logging.info(f"warmup_steps={warmup_steps}, evaluation_steps={self.args.evaluation_steps}")
-
-        logging.info("조기 종료 기능을 포함한 앙상블 기반 모델 파인튜닝을 시작합니다...")
-        
-        # Custom training loop with early stopping
-        best_score = float('-inf')
+        best_f1 = 0.0
         
         for epoch in range(max_epochs):
-            current_epoch = epoch + 1  # 1부터 시작
-            print(f"\n=== Epoch {current_epoch}/{max_epochs} ===")
+            current_epoch = epoch + 1
+            print(f"\n=== Advanced Epoch {current_epoch}/{max_epochs} ===")
             
-            # EarlyStoppingEvaluator에 현재 epoch 설정
-            early_stopping_evaluator.set_current_epoch(current_epoch)
+            # Phase 3: Curriculum Learning으로 점진적 학습 예시 생성
+            train_examples = self.create_advanced_input_examples(train_df, model, epoch)
+            if not train_examples:
+                logging.error("학습 예시를 생성할 수 없습니다.")
+                return
             
-            # 한 에포크 학습
+            train_dataloader = DataLoader(train_examples, shuffle=True, batch_size=self.args.batch_size)
+            
+            # Phase 2: Multi-objective training (Cosine + Contrastive)
+            combined_loss = CombinedAdvancedLoss(cosine_loss, self.contrastive_loss)
+            
+            # Learning rate scheduling
+            current_lr = self.args.lr * (0.95 ** epoch)  # 점진적 감소
+            
+            # 한 에포크 훈련
             model.fit(
-                train_objectives=[(train_dataloader, train_loss)],
-                evaluator=early_stopping_evaluator,
-                epochs=1,  # 한 에포크씩 실행
-                warmup_steps=warmup_steps if epoch == 0 else 0,  # 첫 에포크에만 warmup
-                optimizer_params={'lr': self.args.lr},
+                train_objectives=[(train_dataloader, combined_loss)],
+                evaluator=advanced_evaluator,
+                epochs=1,
+                warmup_steps=100 if epoch == 0 else 0,
+                optimizer_params={'lr': current_lr},
                 output_path=self.args.output_path,
-                evaluation_steps=len(train_dataloader),  # 매 에포크마다 평가
+                evaluation_steps=len(train_dataloader),
                 save_best_model=True,
-                checkpoint_path=os.path.join(self.args.output_path, 'checkpoints'),
-                checkpoint_save_steps=len(train_dataloader),
                 show_progress_bar=True
             )
             
-            # 조기 종료 체크
-            if early_stopping_evaluator.should_stop:
-                print(f"\n조기 종료가 실행되었습니다! (Epoch {current_epoch})")
+            # Phase 3: 적응형 학습률 및 조기 종료
+            current_f1 = advanced_evaluator.get_latest_f1()
+            if current_f1 > best_f1:
+                best_f1 = current_f1
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                
+            logging.info(f"Epoch {current_epoch}: F1={current_f1:.4f}, Best F1={best_f1:.4f}")
+            
+            # patience_counter 초기화 누락 수정
+            if epoch == 0:
+                patience_counter = 0
+            
+            if patience_counter >= self.args.patience:
+                logging.info(f"조기 종료! {self.args.patience} 에포크 동안 F1 개선 없음")
                 break
         
-        # 최종 그래프 저장 (조기 종료되지 않은 경우)
-        if not early_stopping_evaluator.should_stop:
-            early_stopping_evaluator._save_loss_plot(self.args.output_path)
+        # Phase 3: 최종 모델 저장 및 평가
+        self._save_advanced_model_artifacts(model, best_f1)
         
-        logging.info(f"앙상블 기반 모델 파인튜닝 완료. 최적 모델이 '{self.args.output_path}'에 저장되었습니다.")
-        logging.info(f"손실 그래프는 '{os.path.join(self.args.output_path, 'loss_plot.png')}'에서 확인할 수 있습니다.")
+        logging.info(f"Phase 1-3 모델 파인튜닝 완료!")
+        logging.info(f"최고 F1 스코어: {best_f1:.4f}")
+        logging.info(f"모델과 아티팩트가 '{self.args.output_path}'에 저장되었습니다.")
+    
+    def _save_advanced_model_artifacts(self, model, best_f1):
+        """모델 아티팩트 저장"""
+        os.makedirs(self.args.output_path, exist_ok=True)
+        
+        # 메인 모델 저장
+        model.save(self.args.output_path)
+        
+        # 모듈들 저장
+        if self.dynamic_ensemble is not None:
+            torch.save(self.dynamic_ensemble.state_dict(), 
+                      os.path.join(self.args.output_path, 'dynamic_ensemble.pt'))
+            
+        if self.threshold_learner is not None:
+            torch.save(self.threshold_learner.state_dict(), 
+                      os.path.join(self.args.output_path, 'threshold_learner.pt'))
+        
+        # 커리큘럼 정보 저장
+        curriculum_info = {
+            'category_difficulty': self.curriculum_learner.category_difficulty,
+            'final_difficulty': self.curriculum_learner.current_difficulty,
+            'best_f1_score': best_f1
+        }
+        
+        with open(os.path.join(self.args.output_path, 'curriculum_info.json'), 'w') as f:
+            json.dump(curriculum_info, f, indent=2, ensure_ascii=False)
+        
+        logging.info("모든 아티팩트가 저장되었습니다.")
+
+class CombinedAdvancedLoss(nn.Module):
+    """Phase 2: Cosine Loss와 Contrastive Loss 결합"""
+    def __init__(self, cosine_loss, contrastive_loss, alpha=0.7):
+        super().__init__()
+        self.cosine_loss = cosine_loss
+        self.contrastive_loss = contrastive_loss
+        self.alpha = alpha  # cosine loss 가중치
+        
+    def forward(self, sentence_features, labels):
+        # Cosine similarity loss
+        cosine_loss_val = self.cosine_loss(sentence_features, labels)
+        
+        # Contrastive loss (임베딩 추출)
+        embeddings = sentence_features[0]['sentence_embedding']  # [batch_size, embedding_dim]
+        if labels is not None:
+            contrastive_loss_val = self.contrastive_loss(embeddings, labels.view(-1))
+        else:
+            contrastive_loss_val = torch.tensor(0.0).to(embeddings.device)
+        
+        # 가중 결합
+        combined_loss = self.alpha * cosine_loss_val + (1 - self.alpha) * contrastive_loss_val
+        return combined_loss
+
+class AdvancedCategoryEvaluator(SentenceEvaluator):
+    """Phase 1-3: 카테고리 평가자"""
+    def __init__(self, test_df, categories_definitions, threshold_learner=None, 
+                 dynamic_ensemble=None, patience=5, batch_size=32):
+        self.test_df = test_df
+        self.categories_definitions = categories_definitions
+        self.category_names = list(categories_definitions.keys())
+        self.threshold_learner = threshold_learner
+        self.dynamic_ensemble = dynamic_ensemble
+        self.patience = patience
+        self.batch_size = batch_size
+        self.latest_f1 = 0.0
+        
+    def __call__(self, model, output_path=None, epoch=-1, steps=-1):
+        # Phase 1: 다층 카테고리 임베딩
+        category_embs = self._compute_advanced_category_embeddings(model)
+        
+        # Phase 2: 동적 앙상블 제목 임베딩
+        title_embs = self._compute_dynamic_title_embeddings(model)
+        
+        # Phase 3: 적응형 threshold로 예측
+        predictions, true_labels = self._predict_with_adaptive_threshold(
+            title_embs, category_embs, model
+        )
+        
+        # F1 스코어 계산
+        macro_f1 = f1_score(true_labels, predictions, average='macro', zero_division=0)
+        micro_f1 = f1_score(true_labels, predictions, average='micro', zero_division=0)
+        weighted_f1 = f1_score(true_labels, predictions, average='weighted', zero_division=0)
+        
+        self.latest_f1 = macro_f1
+        
+        logging.info(f"Advanced Evaluation - Macro F1: {macro_f1:.4f}, Micro F1: {micro_f1:.4f}, Weighted F1: {weighted_f1:.4f}")
+        
+        return macro_f1
+    
+    def get_latest_f1(self):
+        return self.latest_f1
+    
+    def _compute_advanced_category_embeddings(self, model):
+        """리 임베딩 계산"""
+        # 기존 CategoryAccuracyEvaluator의 multilayer 방식 활용
+        evaluator = CategoryAccuracyEvaluator(self.test_df, self.categories_definitions)
+        return evaluator._compute_multilayer_category_embeddings(model)
+    
+    def _compute_dynamic_title_embeddings(self, model):
+        """동적 앙상블 제목 임베딩"""
+        titles = self.test_df['title'].tolist()
+        generalized_titles = self.test_df['generalized_title'].tolist()
+        
+        original_embs = model.encode(titles, convert_to_tensor=True, normalize_embeddings=True)
+        ner_embs = model.encode(generalized_titles, convert_to_tensor=True, normalize_embeddings=True)
+        
+        if self.dynamic_ensemble is not None:
+            weights = self.dynamic_ensemble(ner_embs, original_embs)
+            ensemble_embs = ner_embs * weights[:, 0:1] + original_embs * weights[:, 1:2]
+        else:
+            ensemble_embs = (ner_embs + original_embs) / 2
+        
+        return F.normalize(ensemble_embs, p=2, dim=1)
+    
+    def _predict_with_adaptive_threshold(self, title_embs, category_embs, model):
+        """적응형 threshold로 예측"""
+        category_embs_tensor = torch.tensor(
+            np.array([category_embs[name] for name in self.category_names]),
+            dtype=torch.float32
+        ).to(title_embs.device)
+        
+        similarities = util.cos_sim(title_embs, category_embs_tensor)
+        
+        predictions = []
+        true_labels = []
+        
+        for i, row in self.test_df.iterrows():
+            sim_scores = similarities[i]
+            
+            if self.threshold_learner is not None:
+                threshold = self.threshold_learner(title_embs[i], sim_scores).item()
+                predicted_indices = (sim_scores > threshold).nonzero(as_tuple=True)[0]
+            else:
+                # 기본: 상위 2개 선택
+                predicted_indices = torch.topk(sim_scores, k=min(2, len(self.category_names))).indices
+            
+            predicted_categories = [self.category_names[idx] for idx in predicted_indices]
+            true_categories = row['categories']
+            
+            # Multi-label을 binary로 변환
+            for cat in self.category_names:
+                predictions.append(1 if cat in predicted_categories else 0)
+                true_labels.append(1 if cat in true_categories else 0)
+        
+        return predictions, true_labels
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="주어진 데이터를 사용하여 Sentence Transformer 모델을 파인튜닝합니다.")
-
-    # 경로 및 모델 설정 
-    parser.add_argument("--model_name", type=str, default=BASE_MODEL_NAME, help="파인튜닝할 기본 모델 이름")
-    parser.add_argument("--ner_model_name", type=str, default=NER_MODEL_NAME, help="NER에 사용할 모델 이름 (현재는 model_utils에서 직접 사용)")
-    parser.add_argument("--data_path", type=str, default=DATA_PATH, help="학습 데이터 CSV 파일 경로")
-    parser.add_argument("--output_path", type=str, default=DEFAULT_OUTPUT_PATH, help="파인튜닝된 모델과 결과를 저장할 경로")
-
-    # 하이퍼파라미터 
-    parser.add_argument("--num_epochs", type=int, default=3, help="총 학습 에포크 수")
-    parser.add_argument("--max_epochs", type=int, default=100, help="조기 종료를 위한 최대 에포크 수")
-    parser.add_argument("--patience", type=int, default=5, help="조기 종료를 위한 인내심 (에포크 수)")
-    parser.add_argument("--batch_size", type=int, default=32, help="학습 배치 사이즈")
-    parser.add_argument("--lr", type=float, default=5e-5, help="학습률 (Learning Rate)")
-    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="전체 스텝 대비 웜업 스텝의 비율")
-    parser.add_argument("--evaluation_steps", type=int, default=100, help="모델 평가를 수행할 스텝 간격")
-
-    # 데이터 및 재현성 설정 
-    parser.add_argument("--test_size", type=float, default=0.2, help="전체 데이터에서 테스트 데이터가 차지할 비율")
-    parser.add_argument("--seed", type=int, default=42, help="실험 재현성을 위한 랜덤 시드")
-
+def main():
+    parser = argparse.ArgumentParser(description="Phase 1-3 문장 임베딩 모델 파인튜닝")
+    parser.add_argument("--data_path", type=str, default="resources/processed_data.csv", help="학습 데이터 경로")
+    parser.add_argument("--model_name", type=str, default="intfloat/multilingual-e5-large", help="사용할 모델명")
+    parser.add_argument("--output_path", type=str, default="outputs/advanced_finetuned_model", help="모델 저장 경로")
+    parser.add_argument("--max_epochs", type=int, default=30, help="최대 에포크 수")
+    parser.add_argument("--batch_size", type=int, default=16, help="배치 크기")
+    parser.add_argument("--lr", type=float, default=2e-5, help="초기 학습률")
+    parser.add_argument("--test_size", type=float, default=0.2, help="테스트 데이터 비율 (Stratified 분할)")
+    parser.add_argument("--patience", type=int, default=7, help="조기 종료 patience (F1 기준)")
+    parser.add_argument("--seed", type=int, default=42, help="랜덤 시드")
+    
+    # 파라미터
+    parser.add_argument("--curriculum_initial_difficulty", type=float, default=0.3, 
+                       help="Curriculum Learning 초기 난이도")
+    parser.add_argument("--contrastive_temperature", type=float, default=0.1, 
+                       help="Contrastive Learning 온도 파라미터")
+    parser.add_argument("--ensemble_alpha", type=float, default=0.7, 
+                       help="Cosine vs Contrastive Loss 가중치")
+    
     args = parser.parse_args()
 
-    if not os.path.isabs(args.data_path):
-        args.data_path = os.path.join(PROJECT_ROOT, args.data_path)
-    if not os.path.isabs(args.output_path):
-        args.output_path = os.path.join(PROJECT_ROOT, args.output_path)
+    # 결과 디렉토리 생성
+    os.makedirs(args.output_path, exist_ok=True)
+    
+    # 로깅 설정
+    log_file = os.path.join(args.output_path, 'advanced_training.log')
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file, encoding='utf-8'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
 
-    finetuner = Finetuner(args)
-    finetuner.run_finetuning()
+    logging.info(f"파라미터: {vars(args)}")
+
+    # AdvancedFinetuner 실행
+    finetuner = AdvancedFinetuner(args)
+    finetuner.run_advanced_finetuning()
+
+if __name__ == "__main__":
+    main()
